@@ -1,0 +1,37 @@
+# CMake & Build Artifacts
+build/
+bin/
+lib/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+trading_engine
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# vcpkg (Ignore the entire vcpkg folder since it's a clone of the package manager)
+vcpkg/
+vcpkg_installed/
+.vcpkg-root
+
+# IDEs & OS Files
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# other
+temp.txt
+*.log
+project_goals.md

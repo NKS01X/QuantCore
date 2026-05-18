@@ -1,0 +1,3 @@
+pyzmq==25.1.2
+pyqtgraph==0.13.3
+PyQt6==6.6.1

@@ -19,6 +19,13 @@ public:
     int  size() const { return count_; }
     bool full() const { return count_ == N; }
 
+    void reset()
+    {
+        buf_.fill(T{});
+        head_  = 0;
+        count_ = 0;
+    }
+
     // index 0 is oldest
     T operator[](int i) const
     {
@@ -65,6 +72,8 @@ public:
         if (buf_.size() < 2) return 0.0;
         return std::sqrt(buf_.mean() * INV_4LN2);
     }
+
+    void reset() { buf_.reset(); }
 
 private:
     CircularBuffer<double, N> buf_;

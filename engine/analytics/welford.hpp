@@ -29,6 +29,13 @@ public:
 
     long count() const { return n_; }
 
+    void reset()
+    {
+        n_    = 0;
+        mean_ = 0.0;
+        M2_   = 0.0;
+    }
+
 private:
     long   n_    = 0;
     double mean_ = 0.0;

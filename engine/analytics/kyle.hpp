@@ -47,6 +47,14 @@ public:
 
     int count() const { return count_; }
 
+    void reset()
+    {
+        dp_.fill(0.0);
+        dv_.fill(0.0);
+        head_  = 0;
+        count_ = 0;
+    }
+
 private:
     std::array<double, N> dp_{};
     std::array<double, N> dv_{};

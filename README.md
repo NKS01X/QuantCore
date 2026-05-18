@@ -50,9 +50,10 @@ This project is not a black-box algorithmic trader — it is a **microstructure 
 | ☣️ **Signal Layer 3** | VPIN | Volume-Synchronized Probability of Informed Trading (Easley, López de Prado, O'Hara 2012) |
 | 🧠 **Signal Layer 4** | Kalman Filter (OBI) | Adaptive noise reduction on the raw Order Book Imbalance signal |
 | 💧 **Signal Layer 5** | Kyle's Lambda | Measures price impact per unit of order flow — a real-time liquidity gauge |
-| ⚡ **Composite Signal** | Multi-Factor Score | Combines all 5 layers into a single, gated trading signal |
+| 🎲 **Signal Layer 6** | Predictive PDF | Location-Scale Student-t distribution fit to next-tick Δprice; outputs P(up), P(down), and directional edge |
+| ⚡ **Composite Signal** | Multi-Factor Score | Combines all 6 layers into a single, gated trading signal |
 | 🔗 **IPC** | ZeroMQ PUB/SUB | Non-blocking, high-throughput message passing at `tcp://127.0.0.1:5555` |
-| 📊 **Dashboard** | 7-Panel Live View | PyQtGraph powered, 50ms refresh, dark-mode, colour-coded signal thresholds |
+| 📊 **Dashboard** | 8-Panel Live View | PyQtGraph powered, 50ms refresh, dark-mode, colour-coded signal thresholds |
 
 ---
 
@@ -63,7 +64,7 @@ This project is not a black-box algorithmic trader — it is a **microstructure 
 │                         C++ BACKEND  (trading_engine)               │
 │                                                                     │
 │  ┌─────────────┐    ┌──────────────┐    ┌─────────────────────┐    │
-│  │  Binance    │    │  Limit Order │    │   5-Layer Signal    │    │
+│  │  Binance    │    │  Limit Order │    │   6-Layer Signal    │    │
 │  │  WebSocket  │───▶│  Book (LOB)  │───▶│       Stack         │    │
 │  │  (100ms)    │    │              │    │                     │    │
 │  └─────────────┘    │  bids: map   │    │  L1: Return Z-Score │    │
@@ -71,7 +72,8 @@ This project is not a black-box algorithmic trader — it is a **microstructure 
 │   ixwebsocket       │              │    │  L3: VPIN           │    │
 │   nlohmann/json     │  midPrice()  │    │  L4: Kalman OBI     │    │
 │                     │  obi()       │    │  L5: Kyle's Lambda  │    │
-│                     └──────────────┘    └──────────┬──────────┘    │
+│                     └──────────────┘    │  L6: Predictive PDF │    │
+│                                         └──────────┬──────────┘    │
 │                                                    │               │
 │                                         ┌──────────▼──────────┐    │
 │                                         │  Composite Signal   │    │
@@ -94,15 +96,16 @@ This project is not a black-box algorithmic trader — it is a **microstructure 
 │  ├──────────┼──────────┼────────────────┤  RollingBuffer[500] │    │
 │  │ Panel 4  │ Panel 5  │    Panel 6     │                     │    │
 │  │ Park Vol │  VPIN    │  Kalman OBI    │  PyQtGraph UI       │    │
-│  ├──────────┴──────────┴────────────────┘                     │    │
-│  │ Panel 7: Kyle's Lambda                                      │    │
-│  └─────────────────────────────────────────────────────────────┘    │
+│  ├──────────┼──────────┼────────────────┘                     │    │
+│  │ Panel 7  │ Panel 8  │                                      │    │
+│  │ Kyle's λ │ PDF Edge │                                      │    │
+│  └──────────┴──────────┴──────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 🔬 The 5-Layer Signal Stack
+## 🔬 The 6-Layer Signal Stack
 
 The heart of the engine is a sequential signal pipeline that transforms raw order book data into a calibrated composite trading score.
 
@@ -160,6 +163,32 @@ Estimates the **price impact coefficient** (Kyle, 1985) — the cost of trading 
 λ       = OLS estimate (rolling window, online update)
 ```
 
+### Layer 6 — Predictive PDF `(predictive_pdf.hpp)`
+
+Models the **next-tick price change** as a **Location-Scale Student's t-distribution** — the theoretically correct choice for HFT returns, which are known to exhibit heavy tails that Gaussian models cannot capture.
+
+In market microstructure, a short-term price move decomposes into a **deterministic drift** (driven by order flow imbalance and price impact) and a **stochastic diffusion** (driven by realized volatility). This layer fuses all upstream signals into a single probabilistic forecast:
+
+```
+x = ΔP_{t+Δt}  ~  t(μ, σ, ν)
+
+μ  = λ_kyle · OBI_kalman · Δt          # drift: flow imbalance × impact × time
+σ  = σ_parkinson · √Δt · (1 + VPIN)   # scale: vol widened by flow toxicity
+ν  ∈ [3, 5]                            # degrees of freedom (tail thickness)
+```
+
+Why Student-t and not Gaussian? Because crypto microstructure is leptokurtic — returns have sharper peaks and fatter tails than a normal distribution. Using ν = 4 (default) gives an excess kurtosis of 6, which closely matches empirical BTC/USDT tick distributions.
+
+The CDF is evaluated in closed form using the **regularised incomplete beta function** (Lentz continued fraction, O(1) per tick, no external dependencies). This yields exact uptick/downtick probabilities:
+
+```
+P(up)  = P(x > 0) = 1 - F_t(-μ/σ; ν)     # CDF evaluated at standardised threshold
+P(dn)  = 1 - P(up)
+edge   = P(up) - P(dn) = 2·P(up) - 1      # signed directional edge ∈ (-1, 1)
+```
+
+The `edge` output is the key actionable quantity: `edge > 0` implies a bullish lean, `edge < 0` a bearish one, and `|edge|` quantifies confidence.
+
 ### Composite Signal
 
 The final signal gates the Kalman-smoothed OBI through three multiplicative factors:
@@ -185,8 +214,9 @@ liq_gate = 1.0  if kyle_lambda < 0.5 (liquid)
 | **5** | VPIN | Flow toxicity tracker with a **0.6 danger-zone** threshold line |
 | **6** | Kalman OBI | Raw OBI (grey) vs. Kalman-smoothed OBI (blue) vs. Innovation (orange) |
 | **7** | Kyle's Lambda | Market liquidity/impact coefficient — spikes indicate thin order books |
+| **8** | Predictive PDF Edge | Rolling directional edge `P(up) - P(dn)` from the Student-t fit; ±0.5 threshold bands |
 
-The top **stat bar** provides a live heads-up display with colour-coded values for Mid-Price, OBI, Return-Z, VPIN, Parkinson Vol, and the Composite Signal.
+The top **stat bar** provides a live heads-up display with colour-coded values for Mid-Price, OBI, Return-Z, VPIN, Parkinson Vol, Composite Signal, and PDF Edge.
 
 ---
 
@@ -284,7 +314,8 @@ hft-engine/
 │   │   ├── parkinson.hpp          # Layer 2: Parkinson volatility estimator
 │   │   ├── vpin.hpp               # Layer 3: VPIN order flow toxicity
 │   │   ├── kalman.hpp             # Layer 4: 1D Kalman filter on OBI
-│   │   └── kyle.hpp               # Layer 5: Kyle's lambda (price impact)
+│   │   ├── kyle.hpp               # Layer 5: Kyle's lambda (price impact)
+│   │   └── predictive_pdf.hpp     # Layer 6: Location-Scale Student-t PDF
 │   ├── publisher/
 │   │   └── publisher.hpp          # ZeroMQ PUB socket wrapper
 │   └── websocket/
@@ -310,6 +341,8 @@ hft-engine/
 | Parkinson Vol | Parkinson, M. (1980). *The Extreme Value Method for Estimating the Variance of the Rate of Return.* Journal of Business. |
 | Kalman Filter | Kalman, R. E. (1960). *A New Approach to Linear Filtering and Prediction Problems.* Journal of Basic Engineering. |
 | Welford's Algorithm | Welford, B. P. (1962). *Note on a Method for Calculating Corrected Sums of Squares and Products.* Technometrics. |
+| Student-t Microstructure | Cont, R. (2001). *Empirical properties of asset returns: stylized facts and statistical issues.* Quantitative Finance, 1(2), 223–236. |
+| Incomplete Beta (CDF) | Press, W. H. et al. (2007). *Numerical Recipes: The Art of Scientific Computing (3rd ed.)* §6.4. Cambridge University Press. |
 
 ---
 

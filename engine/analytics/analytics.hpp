@@ -6,6 +6,7 @@
 #include "vpin.hpp"
 #include "kalman.hpp"
 #include "kyle.hpp"
+#include "predictive_pdf.hpp"
 
 // everything the engine computes per tick, gets serialized into the zmq payload
 struct SignalState
@@ -32,6 +33,12 @@ struct SignalState
 
     // kyle lambda
     double kyle_lambda = 0.0;
+
+    // predictive pdf (Location-Scale Student-t)
+    double pdf_mu      = 0.0;   // expected drift  (mu = lambda * obi_kalman * dt)
+    double pdf_sigma   = 0.0;   // uncertainty scale (vpin-penalised parkinson vol)
+    double pdf_prob_up = 0.0;   // P(delta_price > 0)  [0, 1]
+    double pdf_edge    = 0.0;   // directional edge = 2*prob_up - 1  [-1, 1]
 
     // final output
     double composite = 0.0;

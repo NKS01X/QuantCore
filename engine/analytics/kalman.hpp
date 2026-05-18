@@ -33,6 +33,13 @@ public:
     double smoothed()   const { return x_; }
     double innovation() const { return innov_; }
 
+    void reset()
+    {
+        x_     = 0.0;
+        P_     = 1.0;
+        innov_ = 0.0;
+    }
+
 private:
     double Q_;
     double R_;

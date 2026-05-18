@@ -16,10 +16,17 @@ try:
 except ImportError:
     SCIPY_AVAILABLE = False
 
-ZMQ_ADDRESS   = "tcp://127.0.0.1:5555"
+ZMQ_DATA_ADDR = "tcp://127.0.0.1:5555"
+ZMQ_CMD_ADDR  = "tcp://127.0.0.1:5556"
 POLL_INTERVAL = 50
 HISTORY_LEN   = 500
 HIST_BINS     = 40
+
+SYMBOLS = [
+    "btcusdt", "ethusdt", "solusdt",
+    "bnbusdt", "xrpusdt", "dogeusdt",
+    "adausdt", "avaxusdt",
+]
 
 BG_COLOR      = "#0d1117"
 PANEL_COLOR   = "#161b22"
@@ -54,7 +61,7 @@ class ZmqThread(threading.Thread):
         ctx  = zmq.Context()
         sock = ctx.socket(zmq.SUB)
         sock.setsockopt_string(zmq.SUBSCRIBE, "")
-        sock.connect(ZMQ_ADDRESS)
+        sock.connect(ZMQ_DATA_ADDR)
 
         poller = zmq.Poller()
         poller.register(sock, zmq.POLLIN)
@@ -113,6 +120,14 @@ class Dashboard:
         pg.setConfigOption("foreground", TEXT_COLOR)
         pg.setConfigOption("antialias",  True)
 
+        # command publisher — sends config changes to C++ engine
+        self._cmd_ctx  = zmq.Context()
+        self._cmd_sock = self._cmd_ctx.socket(zmq.PUB)
+        self._cmd_sock.bind(ZMQ_CMD_ADDR)
+
+        self._active_symbol = "btcusdt"
+        self._active_dt_ms  = 500
+
         self.win = QtWidgets.QMainWindow()
         self.win.setWindowTitle("HFT Engine — Microstructure Dashboard")
         self.win.resize(1600, 960)
@@ -124,12 +139,58 @@ class Dashboard:
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(8)
 
-        title = QtWidgets.QLabel("⚡  BTC/USDT  ·  Real-Time Microstructure")
-        title.setStyleSheet(
+        # ── title + control bar row ───────────────────────────────────────────
+        header = QtWidgets.QHBoxLayout()
+        header.setSpacing(14)
+
+        self.title_label = QtWidgets.QLabel("⚡  BTC/USDT  ·  Real-Time Microstructure")
+        self.title_label.setStyleSheet(
             f"color: {TEXT_COLOR}; font-size: 17px; font-weight: bold;"
             "font-family: 'Consolas', 'Courier New', monospace;"
         )
-        root.addWidget(title)
+        header.addWidget(self.title_label)
+        header.addStretch()
+
+        ctrl_style = (
+            f"background-color: {PANEL_COLOR}; color: {TEXT_COLOR};"
+            f"border: 1px solid {GRID_COLOR}; border-radius: 4px;"
+            "font-family: Consolas; font-size: 13px; padding: 4px 8px;"
+        )
+
+        lbl_sym = QtWidgets.QLabel("Symbol")
+        lbl_sym.setStyleSheet(f"color: #8b949e; font-size: 11px; font-family: Consolas;")
+        header.addWidget(lbl_sym)
+
+        self.combo_symbol = QtWidgets.QComboBox()
+        for s in SYMBOLS:
+            self.combo_symbol.addItem(s.upper(), s)
+        self.combo_symbol.setCurrentIndex(0)
+        self.combo_symbol.setStyleSheet(ctrl_style + " min-width: 110px;")
+        header.addWidget(self.combo_symbol)
+
+        lbl_dt = QtWidgets.QLabel("Horizon (ms)")
+        lbl_dt.setStyleSheet(f"color: #8b949e; font-size: 11px; font-family: Consolas;")
+        header.addWidget(lbl_dt)
+
+        self.spin_dt = QtWidgets.QSpinBox()
+        self.spin_dt.setRange(100, 5000)
+        self.spin_dt.setSingleStep(100)
+        self.spin_dt.setValue(500)
+        self.spin_dt.setSuffix(" ms")
+        self.spin_dt.setStyleSheet(ctrl_style + " min-width: 90px;")
+        header.addWidget(self.spin_dt)
+
+        self.btn_apply = QtWidgets.QPushButton("Apply")
+        self.btn_apply.setStyleSheet(
+            f"background-color: #238636; color: {TEXT_COLOR};"
+            "border: 1px solid #2ea043; border-radius: 4px;"
+            "font-family: Consolas; font-size: 13px; font-weight: bold;"
+            "padding: 5px 16px;"
+        )
+        self.btn_apply.clicked.connect(self._on_apply)
+        header.addWidget(self.btn_apply)
+
+        root.addLayout(header)
 
         stat_row = QtWidgets.QHBoxLayout()
         stat_row.setSpacing(12)
@@ -385,11 +446,63 @@ class Dashboard:
         y7 = self.buf_lambda.get()
         self.c_lambda.setData(np.arange(len(y7), dtype=np.float64), y7)
 
+    # ── config change handler ──────────────────────────────────────────────
+
+    def _on_apply(self):
+        new_sym = self.combo_symbol.currentData()
+        new_dt  = self.spin_dt.value()
+
+        cmd = json.dumps({
+            "command": "update_config",
+            "symbol":  new_sym,
+            "dt_ms":   new_dt,
+        })
+        self._cmd_sock.send_string(cmd)
+
+        self._active_symbol = new_sym
+        self._active_dt_ms  = new_dt
+
+        # update title to reflect new symbol
+        pretty = new_sym.upper().replace("USDT", "/USDT")
+        self.title_label.setText(f"⚡  {pretty}  ·  Real-Time Microstructure")
+
+        # purge all rolling buffers so stale data doesn't mix with the new feed
+        for buf in (self.buf_price, self.buf_zscore, self.buf_returns,
+                    self.buf_park, self.buf_obinorm, self.buf_vpin,
+                    self.buf_obi_raw, self.buf_obi_kal, self.buf_innov,
+                    self.buf_lambda):
+            buf._n    = 0
+            buf._head = 0
+            buf._buf[:] = 0.0
+
+        # clear all plot curves immediately
+        self.c_price.setData([], [])
+        self.c_zscore.setData([], [])
+        self.c_park.setData([], [])
+        self.c_obinorm.setData([], [])
+        self.c_vpin.setData([], [])
+        self.c_obi_raw.setData([], [])
+        self.c_obi_kalman.setData([], [])
+        self.c_innov.setData([], [])
+        self.c_lambda.setData([], [])
+        self.pdf_curve.setData([], [])
+        if self.hist_bars is not None:
+            self.p3.removeItem(self.hist_bars)
+            self.hist_bars = None
+
+        self.frame_count = 0
+        self._set_stat(self.lbl_frames, "0")
+        self._set_stat(self.lbl_conn, "● Switching…", WARN_COLOR)
+
+        print(f"[CMD] Sent: {cmd}")
+
     def run(self):
         self.win.show()
         code = self.app.exec()
         self.zmq_thread.stop()
         self.zmq_thread.join(timeout=2)
+        self._cmd_sock.close()
+        self._cmd_ctx.term()
         sys.exit(code)
 
 

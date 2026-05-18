@@ -70,6 +70,17 @@ public:
         return bucket_sum_ / (double)filled_;
     }
 
+    void reset()
+    {
+        cur_buy_    = 0.0;
+        cur_sell_   = 0.0;
+        ticks_      = 0;
+        bucket_sum_ = 0.0;
+        head_       = 0;
+        filled_     = 0;
+        hist_.fill(0.0);
+    }
+
 private:
     double cur_buy_  = 0.0;
     double cur_sell_ = 0.0;

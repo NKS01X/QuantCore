@@ -1,52 +1,57 @@
 #!/usr/bin/env python3
-"""
-Step 5 — Real-Time HFT Dashboard
-Subscribes to the ZMQ stream from the C++ engine and renders:
-  - Visual 1: Live Mid-Price line chart
-  - Visual 2: Bid vs Ask bar chart (top 5 levels)
-  - Visual 3: OBI gauge (text metric)
-"""
 
 import json
 import queue
 import sys
 import threading
-import time
 
 import numpy as np
 import pyqtgraph as pg
 import zmq
 from pyqtgraph.Qt import QtCore, QtWidgets
 
-# ── Config ───────────────────────────────────────────────────────────────────
-ZMQ_ADDRESS   = "tcp://127.0.0.1:5555"
-POLL_INTERVAL = 50          # ms — QTimer tick
-HISTORY_LEN   = 300         # number of mid-price samples to keep
+try:
+    from scipy import stats as scipy_stats
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
 
-# ── Colour palette ────────────────────────────────────────────────────────────
+ZMQ_ADDRESS   = "tcp://127.0.0.1:5555"
+POLL_INTERVAL = 50
+HISTORY_LEN   = 500
+HIST_BINS     = 40
+
 BG_COLOR      = "#0d1117"
 PANEL_COLOR   = "#161b22"
 GRID_COLOR    = "#21262d"
-BID_COLOR     = "#3fb950"   # green
-ASK_COLOR     = "#f85149"   # red
-PRICE_COLOR   = "#58a6ff"   # blue
+BID_COLOR     = "#3fb950"
+ASK_COLOR     = "#f85149"
+PRICE_COLOR   = "#58a6ff"
 TEXT_COLOR    = "#e6edf3"
-ACCENT_COLOR  = "#d2a8ff"   # purple for OBI
+ACCENT_COLOR  = "#d2a8ff"
+WARN_COLOR    = "#f0883e"
+KALMAN_COLOR  = "#79c0ff"
+INNOV_COLOR   = "#ffa657"
+LAMBDA_COLOR  = "#ff7b72"
+VOL_COLOR     = "#a5d6ff"
+COMPOSITE_POS = "#3fb950"
+COMPOSITE_NEG = "#f85149"
+ZSCORE_COLOR  = "#e3b341"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Background ZMQ reader thread
-# ─────────────────────────────────────────────────────────────────────────────
+def make_pen(color, width=1.5):
+    return pg.mkPen(color, width=width)
+
+
 class ZmqThread(threading.Thread):
-    """Daemon thread: reads ZMQ messages and stuffs them into a queue."""
 
-    def __init__(self, data_queue: queue.Queue):
+    def __init__(self, q: queue.Queue):
         super().__init__(daemon=True)
-        self.data_queue = data_queue
-        self._stop_event = threading.Event()
+        self.q = q
+        self._stop = threading.Event()
 
     def run(self):
-        ctx = zmq.Context()
+        ctx  = zmq.Context()
         sock = ctx.socket(zmq.SUB)
         sock.setsockopt_string(zmq.SUBSCRIBE, "")
         sock.connect(ZMQ_ADDRESS)
@@ -54,19 +59,19 @@ class ZmqThread(threading.Thread):
         poller = zmq.Poller()
         poller.register(sock, zmq.POLLIN)
 
-        while not self._stop_event.is_set():
-            events = dict(poller.poll(timeout=100))
-            if sock in events:
+        while not self._stop.is_set():
+            evts = dict(poller.poll(timeout=100))
+            if sock in evts:
                 raw = sock.recv_string()
                 try:
                     data = json.loads(raw)
-                    # Drop old frames so the queue never grows unbounded
-                    if self.data_queue.qsize() > 20:
+                    # drop stale messages if we're falling behind
+                    if self.q.qsize() > 20:
                         try:
-                            self.data_queue.get_nowait()
+                            self.q.get_nowait()
                         except queue.Empty:
                             pass
-                    self.data_queue.put_nowait(data)
+                    self.q.put_nowait(data)
                 except json.JSONDecodeError:
                     pass
 
@@ -74,243 +79,319 @@ class ZmqThread(threading.Thread):
         ctx.term()
 
     def stop(self):
-        self._stop_event.set()
+        self._stop.set()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main dashboard window
-# ─────────────────────────────────────────────────────────────────────────────
+class RollingBuffer:
+    def __init__(self, maxlen: int):
+        self._buf  = np.zeros(maxlen)
+        self._n    = 0
+        self._head = 0
+        self._cap  = maxlen
+
+    def push(self, v: float):
+        self._buf[self._head] = v
+        self._head = (self._head + 1) % self._cap
+        if self._n < self._cap:
+            self._n += 1
+
+    def get(self) -> np.ndarray:
+        if self._n < self._cap:
+            return self._buf[:self._n].copy()
+        return np.roll(self._buf, -self._head)
+
+    def __len__(self):
+        return self._n
+
+
 class Dashboard:
+
     def __init__(self):
-        # ── App ──────────────────────────────────────────────────────────────
         self.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
 
         pg.setConfigOption("background", BG_COLOR)
         pg.setConfigOption("foreground", TEXT_COLOR)
-        pg.setConfigOption("antialias", True)
+        pg.setConfigOption("antialias",  True)
 
-        # ── Main window ──────────────────────────────────────────────────────
         self.win = QtWidgets.QMainWindow()
-        self.win.setWindowTitle("HFT Engine — Live Dashboard")
-        self.win.resize(1280, 780)
+        self.win.setWindowTitle("HFT Engine — Microstructure Dashboard")
+        self.win.resize(1600, 960)
         self.win.setStyleSheet(f"background-color: {BG_COLOR};")
 
         central = QtWidgets.QWidget()
         self.win.setCentralWidget(central)
-        root_layout = QtWidgets.QVBoxLayout(central)
-        root_layout.setContentsMargins(12, 12, 12, 12)
-        root_layout.setSpacing(10)
+        root = QtWidgets.QVBoxLayout(central)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(8)
 
-        # ── Title bar ────────────────────────────────────────────────────────
-        title = QtWidgets.QLabel("⚡  BTC/USDT  ·  Real-Time Microstructure Dashboard")
+        title = QtWidgets.QLabel("⚡  BTC/USDT  ·  Real-Time Microstructure")
         title.setStyleSheet(
-            f"color: {TEXT_COLOR}; font-size: 18px; font-weight: bold;"
+            f"color: {TEXT_COLOR}; font-size: 17px; font-weight: bold;"
             "font-family: 'Consolas', 'Courier New', monospace;"
         )
-        root_layout.addWidget(title)
+        root.addWidget(title)
 
-        # ── OBI / stat bar ───────────────────────────────────────────────────
         stat_row = QtWidgets.QHBoxLayout()
-        stat_row.setSpacing(20)
-        self.lbl_mid   = self._stat_label("Mid Price",  "--")
-        self.lbl_obi   = self._stat_label("OBI",        "--")
-        self.lbl_msgs  = self._stat_label("Frames",     "0")
-        self.lbl_conn  = self._stat_label("Status",     "Connecting…")
-        for w in (self.lbl_mid, self.lbl_obi, self.lbl_msgs, self.lbl_conn):
+        stat_row.setSpacing(12)
+        self.lbl_mid       = self._stat_label("Mid Price",   "--")
+        self.lbl_obi       = self._stat_label("OBI (raw)",   "--")
+        self.lbl_rz        = self._stat_label("Return Z",    "--")
+        self.lbl_vpin      = self._stat_label("VPIN",        "--")
+        self.lbl_park      = self._stat_label("Park Vol",    "--")
+        self.lbl_composite = self._stat_label("Composite",   "--")
+        self.lbl_frames    = self._stat_label("Frames",      "0")
+        self.lbl_conn      = self._stat_label("Status",      "Connecting…")
+        for w in (self.lbl_mid, self.lbl_obi, self.lbl_rz,
+                  self.lbl_vpin, self.lbl_park, self.lbl_composite,
+                  self.lbl_frames, self.lbl_conn):
             stat_row.addWidget(w)
         stat_row.addStretch()
-        root_layout.addLayout(stat_row)
+        root.addLayout(stat_row)
 
-        # ── Charts container ─────────────────────────────────────────────────
-        charts_layout = QtWidgets.QHBoxLayout()
-        charts_layout.setSpacing(10)
-        root_layout.addLayout(charts_layout)
+        row1 = QtWidgets.QHBoxLayout()
+        row1.setSpacing(8)
+        row2 = QtWidgets.QHBoxLayout()
+        row2.setSpacing(8)
 
-        # Visual 1 — Mid-Price line chart (left, wider)
-        self.price_plot = self._make_plot_widget(
-            title="Mid-Price  (BTC/USDT)",
-            left_label="Price (USDT)",
-            bottom_label="Samples",
+        self.p1 = self._plot("Mid-Price  (BTC/USDT)", "Price (USDT)", "Ticks")
+        self.c_price = self.p1.plot(pen=make_pen(PRICE_COLOR, 2), name="Mid-Price")
+        row1.addWidget(self.p1, stretch=3)
+
+        self.p2 = self._plot("Return Z-Score  (Welford)", "Z-Score", "Ticks")
+        self.c_zscore = self.p2.plot(pen=make_pen(ZSCORE_COLOR, 1.5))
+        for y in (2.5, -2.5):
+            tl = pg.InfiniteLine(
+                pos=y, angle=0,
+                pen=pg.mkPen(WARN_COLOR, width=1, style=QtCore.Qt.PenStyle.DashLine),
+            )
+            self.p2.addItem(tl)
+        self.p2.setYRange(-5, 5, padding=0)
+        row1.addWidget(self.p2, stretch=2)
+
+        self.p3 = self._plot("Return Distribution  (last 500)", "Count", "Return")
+        self.hist_bars: pg.BarGraphItem | None = None
+        self.pdf_curve = self.p3.plot(pen=make_pen(ACCENT_COLOR, 2))
+        row1.addWidget(self.p3, stretch=2)
+
+        self.p4 = self._plot("Parkinson Vol  & Vol-Adj OBI", "Value", "Ticks")
+        self.c_park    = self.p4.plot(pen=make_pen(VOL_COLOR, 1.5),    name="Park Vol")
+        self.c_obinorm = self.p4.plot(pen=make_pen(ACCENT_COLOR, 1.5), name="OBI/Vol")
+        legend4 = self.p4.addLegend(offset=(10, 10))
+        legend4.setParentItem(self.p4.graphicsItem())
+        row2.addWidget(self.p4, stretch=2)
+
+        self.p5 = self._plot("VPIN  (Order Flow Toxicity)", "VPIN", "Ticks")
+        self.c_vpin = self.p5.plot(pen=make_pen(WARN_COLOR, 1.5))
+        vpin_thresh = pg.InfiniteLine(
+            pos=0.6, angle=0,
+            pen=pg.mkPen(ASK_COLOR, width=1, style=QtCore.Qt.PenStyle.DashLine),
         )
-        self.price_curve = self.price_plot.plot(
-            pen=pg.mkPen(PRICE_COLOR, width=2),
-            name="Mid-Price",
-        )
-        charts_layout.addWidget(self.price_plot, stretch=3)
+        self.p5.addItem(vpin_thresh)
+        self.p5.setYRange(0, 1, padding=0.05)
+        row2.addWidget(self.p5, stretch=2)
 
-        # Visual 2 — Bid vs Ask bar chart (right)
-        self.book_plot = self._make_plot_widget(
-            title="Order Book Depth  (Top 5 Levels)",
-            left_label="Qty",
-            bottom_label="Price Level",
-        )
-        # We'll manage bars manually via BarGraphItem
-        self.bid_bars: pg.BarGraphItem | None = None
-        self.ask_bars: pg.BarGraphItem | None = None
-        charts_layout.addWidget(self.book_plot, stretch=2)
+        self.p6 = self._plot("Kalman Filter  (OBI)", "OBI", "Ticks")
+        self.c_obi_raw    = self.p6.plot(pen=make_pen(GRID_COLOR, 1),    name="Raw OBI")
+        self.c_obi_kalman = self.p6.plot(pen=make_pen(KALMAN_COLOR, 2),  name="Kalman")
+        self.c_innov      = self.p6.plot(pen=make_pen(INNOV_COLOR, 1.2), name="Innovation")
+        legend6 = self.p6.addLegend(offset=(10, 10))
+        legend6.setParentItem(self.p6.graphicsItem())
+        row2.addWidget(self.p6, stretch=2)
 
-        # ── State ────────────────────────────────────────────────────────────
-        self.mid_history: list[float] = []
-        self.frame_count  = 0
+        self.p7 = self._plot("Kyle's λ  (Price Impact)", "λ", "Ticks")
+        self.c_lambda = self.p7.plot(pen=make_pen(LAMBDA_COLOR, 1.5))
+        row2.addWidget(self.p7, stretch=2)
 
-        # ── Data queue & ZMQ thread ──────────────────────────────────────────
+        root.addLayout(row1, stretch=5)
+        root.addLayout(row2, stretch=5)
+
+        self.buf_price   = RollingBuffer(HISTORY_LEN)
+        self.buf_zscore  = RollingBuffer(HISTORY_LEN)
+        self.buf_returns = RollingBuffer(HISTORY_LEN)
+        self.buf_park    = RollingBuffer(HISTORY_LEN)
+        self.buf_obinorm = RollingBuffer(HISTORY_LEN)
+        self.buf_vpin    = RollingBuffer(HISTORY_LEN)
+        self.buf_obi_raw = RollingBuffer(HISTORY_LEN)
+        self.buf_obi_kal = RollingBuffer(HISTORY_LEN)
+        self.buf_innov   = RollingBuffer(HISTORY_LEN)
+        self.buf_lambda  = RollingBuffer(HISTORY_LEN)
+
+        self.frame_count = 0
+
         self.data_queue = queue.Queue()
         self.zmq_thread = ZmqThread(self.data_queue)
         self.zmq_thread.start()
 
-        # ── QTimer ───────────────────────────────────────────────────────────
         self.timer = QtCore.QTimer()
         self.timer.setInterval(POLL_INTERVAL)
         self.timer.timeout.connect(self._on_tick)
         self.timer.start()
 
-    # ── Helpers ──────────────────────────────────────────────────────────────
-
     def _stat_label(self, heading: str, value: str) -> QtWidgets.QFrame:
-        """Returns a framed stat widget (heading + value)."""
         frame = QtWidgets.QFrame()
         frame.setStyleSheet(
             f"background-color: {PANEL_COLOR}; border-radius: 8px;"
             f"border: 1px solid {GRID_COLOR};"
         )
-        frame.setMinimumWidth(160)
+        frame.setMinimumWidth(130)
         layout = QtWidgets.QVBoxLayout(frame)
-        layout.setContentsMargins(12, 8, 12, 8)
+        layout.setContentsMargins(10, 6, 10, 6)
         layout.setSpacing(2)
 
         h = QtWidgets.QLabel(heading)
-        h.setStyleSheet(f"color: #8b949e; font-size: 11px; font-family: Consolas;")
+        h.setStyleSheet("color: #8b949e; font-size: 10px; font-family: Consolas;")
         layout.addWidget(h)
 
         v = QtWidgets.QLabel(value)
         v.setStyleSheet(
-            f"color: {TEXT_COLOR}; font-size: 20px; font-weight: bold;"
+            f"color: {TEXT_COLOR}; font-size: 17px; font-weight: bold;"
             "font-family: Consolas;"
         )
         v.setObjectName("value")
         layout.addWidget(v)
 
-        # Store reference to value label inside frame
         frame._value_label = v  # type: ignore[attr-defined]
         return frame
 
     def _set_stat(self, frame: QtWidgets.QFrame, text: str, color: str = TEXT_COLOR):
-        frame._value_label.setText(text)           # type: ignore[attr-defined]
-        frame._value_label.setStyleSheet(          # type: ignore[attr-defined]
-            f"color: {color}; font-size: 20px; font-weight: bold;"
+        frame._value_label.setText(text)          # type: ignore[attr-defined]
+        frame._value_label.setStyleSheet(         # type: ignore[attr-defined]
+            f"color: {color}; font-size: 17px; font-weight: bold;"
             "font-family: Consolas;"
         )
 
-    def _make_plot_widget(
-        self, title: str, left_label: str, bottom_label: str
-    ) -> pg.PlotWidget:
+    def _plot(self, title: str, left: str, bottom: str) -> pg.PlotWidget:
         pw = pg.PlotWidget(title=title)
         pw.setBackground(PANEL_COLOR)
-        pw.showGrid(x=True, y=True, alpha=0.15)
-        pw.setLabel("left",   left_label,   color=TEXT_COLOR)
-        pw.setLabel("bottom", bottom_label, color=TEXT_COLOR)
+        pw.showGrid(x=True, y=True, alpha=0.12)
+        pw.setLabel("left",   left,   color=TEXT_COLOR)
+        pw.setLabel("bottom", bottom, color=TEXT_COLOR)
         pw.getPlotItem().titleLabel.setText(
-            f'<span style="color:{TEXT_COLOR}; font-size:13px;">{title}</span>'
+            f'<span style="color:{TEXT_COLOR}; font-size:12px;">{title}</span>'
         )
-        # Style axes
         for axis in ("left", "bottom"):
             pw.getAxis(axis).setTextPen(pg.mkPen(TEXT_COLOR))
             pw.getAxis(axis).setPen(pg.mkPen(GRID_COLOR))
         return pw
 
-    # ── Timer tick ───────────────────────────────────────────────────────────
-
     def _on_tick(self):
-        """Drain the queue and update all visuals."""
-        latest: dict | None = None
-
-        # Drain — keep only the newest frame from this tick
+        latest = None
         while not self.data_queue.empty():
             try:
                 latest = self.data_queue.get_nowait()
             except queue.Empty:
                 break
-
         if latest is None:
             return
-
         self.frame_count += 1
-        self._update_visuals(latest)
+        self._update(latest)
 
-    def _update_visuals(self, data: dict):
-        mid_price: float = data.get("mid_price", 0.0)
-        obi: float       = data.get("obi", 0.0)
-        bids: list       = data.get("bids", [])
-        asks: list       = data.get("asks", [])
+    def _update(self, d: dict):
+        mid       = d.get("mid_price",       0.0)
+        obi       = d.get("obi",             0.0)
+        ret       = d.get("ret",             0.0)
+        rz        = d.get("return_zscore",   0.0)
+        park_vol  = d.get("park_vol",        0.0)
+        obi_norm  = d.get("obi_normalized",  0.0)
+        vpin      = d.get("vpin",            0.0)
+        obi_kal   = d.get("obi_kalman",      0.0)
+        innov     = d.get("kalman_innovation", 0.0)
+        lam       = d.get("kyle_lambda",     0.0)
+        composite = d.get("composite",       0.0)
 
-        # ── Stat bar ──────────────────────────────────────────────────────────
-        self._set_stat(self.lbl_mid,  f"${mid_price:,.2f}", PRICE_COLOR)
+        self.buf_price.push(mid)
+        self.buf_zscore.push(rz)
+        self.buf_returns.push(ret)
+        self.buf_park.push(park_vol)
+        self.buf_obinorm.push(obi_norm)
+        self.buf_vpin.push(vpin)
+        self.buf_obi_raw.push(obi)
+        self.buf_obi_kal.push(obi_kal)
+        self.buf_innov.push(innov)
+        self.buf_lambda.push(lam)
 
-        obi_color = BID_COLOR if obi >= 0 else ASK_COLOR
-        sign      = "+" if obi >= 0 else ""
-        self._set_stat(self.lbl_obi,  f"{sign}{obi:.4f}", obi_color)
-        self._set_stat(self.lbl_msgs, str(self.frame_count))
+        self._set_stat(self.lbl_mid, f"${mid:,.2f}", PRICE_COLOR)
+
+        obi_col  = BID_COLOR if obi >= 0 else ASK_COLOR
+        sign_str = "+" if obi >= 0 else ""
+        self._set_stat(self.lbl_obi, f"{sign_str}{obi:.4f}", obi_col)
+
+        rz_col = (BID_COLOR if abs(rz) < 2.5
+                  else WARN_COLOR if abs(rz) < 3.5
+                  else ASK_COLOR)
+        self._set_stat(self.lbl_rz, f"{rz:+.2f}σ", rz_col)
+
+        vpin_col = BID_COLOR if vpin < 0.4 else WARN_COLOR if vpin < 0.6 else ASK_COLOR
+        self._set_stat(self.lbl_vpin, f"{vpin:.3f}", vpin_col)
+        self._set_stat(self.lbl_park, f"{park_vol:.5f}", VOL_COLOR)
+
+        comp_col = COMPOSITE_POS if composite > 0 else COMPOSITE_NEG
+        self._set_stat(self.lbl_composite, f"{composite:+.3f}", comp_col)
+        self._set_stat(self.lbl_frames, str(self.frame_count))
         self._set_stat(self.lbl_conn, "● Live", BID_COLOR)
 
-        # ── Visual 1: Mid-Price history ───────────────────────────────────────
-        self.mid_history.append(mid_price)
-        if len(self.mid_history) > HISTORY_LEN:
-            self.mid_history = self.mid_history[-HISTORY_LEN:]
-        y = np.array(self.mid_history, dtype=np.float64)
-        x = np.arange(len(y), dtype=np.float64)
-        self.price_curve.setData(x, y)
-        # Auto-zoom Y to ±0.5 of current range so chart doesn't drift wildly
-        if len(y) > 1:
-            pad = max((y.max() - y.min()) * 0.1, 1.0)
-            self.price_plot.setYRange(y.min() - pad, y.max() + pad, padding=0)
+        n = len(self.buf_price)
+        x = np.arange(n, dtype=np.float64)
 
-        # ── Visual 2: Order book depth bars ───────────────────────────────────
-        if not bids or not asks:
-            return
+        y1 = self.buf_price.get()
+        self.c_price.setData(x, y1)
+        if len(y1) > 1:
+            pad = max((y1.max() - y1.min()) * 0.1, 1.0)
+            self.p1.setYRange(y1.min() - pad, y1.max() + pad, padding=0)
 
-        # Top 5 bid prices (descending) and ask prices (ascending)
-        bid_prices = np.array([b["price"] for b in bids[:5]], dtype=np.float64)
-        bid_qtys   = np.array([b["qty"]   for b in bids[:5]], dtype=np.float64)
-        ask_prices = np.array([a["price"] for a in asks[:5]], dtype=np.float64)
-        ask_qtys   = np.array([a["qty"]   for a in asks[:5]], dtype=np.float64)
+        y2 = self.buf_zscore.get()
+        self.c_zscore.setData(np.arange(len(y2), dtype=np.float64), y2)
 
-        # Remove old bars
-        if self.bid_bars is not None:
-            self.book_plot.removeItem(self.bid_bars)
-        if self.ask_bars is not None:
-            self.book_plot.removeItem(self.ask_bars)
+        rets = self.buf_returns.get()
+        if len(rets) > 10:
+            counts, edges = np.histogram(rets, bins=HIST_BINS)
+            centers = (edges[:-1] + edges[1:]) / 2
+            width   = edges[1] - edges[0]
 
-        bar_w = 0.3  # tick spacing is typically $0.01; keep bars thin
-        self.bid_bars = pg.BarGraphItem(
-            x=bid_prices - bar_w / 2, height=bid_qtys,
-            width=bar_w, brush=BID_COLOR, pen=pg.mkPen(None),
-        )
-        self.ask_bars = pg.BarGraphItem(
-            x=ask_prices + bar_w / 2, height=ask_qtys,
-            width=bar_w, brush=ASK_COLOR, pen=pg.mkPen(None),
-        )
-        self.book_plot.addItem(self.bid_bars)
-        self.book_plot.addItem(self.ask_bars)
+            if self.hist_bars is not None:
+                self.p3.removeItem(self.hist_bars)
+            self.hist_bars = pg.BarGraphItem(
+                x=centers, height=counts, width=width * 0.85,
+                brush=pg.mkBrush(ZSCORE_COLOR + "55"), pen=pg.mkPen(ZSCORE_COLOR),
+            )
+            self.p3.addItem(self.hist_bars)
 
-        all_prices = np.concatenate([bid_prices, ask_prices])
-        spread     = max(all_prices.max() - all_prices.min(), 0.05)
-        self.book_plot.setXRange(
-            all_prices.min() - spread * 0.5,
-            all_prices.max() + spread * 0.5,
-            padding=0,
-        )
+            if SCIPY_AVAILABLE and len(rets) > 30:
+                try:
+                    df, loc, scale = scipy_stats.t.fit(rets, f0=4)
+                except Exception:
+                    df, loc, scale = 4, float(np.mean(rets)), float(np.std(rets))
+                x_pdf = np.linspace(edges[0], edges[-1], 200)
+                y_pdf = scipy_stats.t.pdf(x_pdf, df, loc, scale) * len(rets) * width
+                self.pdf_curve.setData(x_pdf, y_pdf)
+            else:
+                self.pdf_curve.setData([], [])
 
-    # ── Run ──────────────────────────────────────────────────────────────────
+        y_park   = self.buf_park.get()
+        y_obinrm = self.buf_obinorm.get()
+        self.c_park.setData(np.arange(len(y_park), dtype=np.float64), y_park)
+        self.c_obinorm.setData(np.arange(len(y_obinrm), dtype=np.float64), y_obinrm)
+
+        y5 = self.buf_vpin.get()
+        self.c_vpin.setData(np.arange(len(y5), dtype=np.float64), y5)
+
+        y_raw = self.buf_obi_raw.get()
+        y_kal = self.buf_obi_kal.get()
+        y_inn = self.buf_innov.get()
+        self.c_obi_raw.setData(np.arange(len(y_raw), dtype=np.float64), y_raw)
+        self.c_obi_kalman.setData(np.arange(len(y_kal), dtype=np.float64), y_kal)
+        self.c_innov.setData(np.arange(len(y_inn), dtype=np.float64), y_inn)
+
+        y7 = self.buf_lambda.get()
+        self.c_lambda.setData(np.arange(len(y7), dtype=np.float64), y7)
 
     def run(self):
         self.win.show()
-        exit_code = self.app.exec()
+        code = self.app.exec()
         self.zmq_thread.stop()
         self.zmq_thread.join(timeout=2)
-        sys.exit(exit_code)
+        sys.exit(code)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
     db = Dashboard()

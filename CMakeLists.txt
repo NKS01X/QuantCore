@@ -19,6 +19,11 @@ add_executable(trading_engine
     engine/websocket/wb.cpp
 )
 
+# Include paths (engine/ root so analytics/*.hpp resolves via relative paths)
+target_include_directories(trading_engine PRIVATE
+    ${CMAKE_SOURCE_DIR}/engine
+)
+
 # Link libraries
 target_link_libraries(trading_engine PRIVATE
     nlohmann_json::nlohmann_json

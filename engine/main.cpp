@@ -24,6 +24,8 @@ static void printOrderBook(const json& payload, const std::string& symbol)
 
     std::cout << std::fixed << std::setprecision(2);
     std::cout << "  Mid Price  : " << payload["mid_price"].get<double>() << "\n";
+    std::cout << "  Micro Price: " << payload["micro_price"].get<double>()
+              << " (Dev: " << std::setprecision(4) << payload["micro_price_dev"].get<double>() << ")\n";
     std::cout << std::setprecision(4);
     std::cout << "  OBI (raw)  : " << payload["obi"].get<double>()            << "\n";
     std::cout << "  OBI Kalman : " << payload["obi_kalman"].get<double>()      << "\n";
@@ -32,9 +34,17 @@ static void printOrderBook(const json& payload, const std::string& symbol)
     std::cout << "  OBI/Vol    : " << payload["obi_normalized"].get<double>()  << "\n";
     std::cout << "  VPIN       : " << payload["vpin"].get<double>()            << "\n";
     std::cout << "  Kyle λ     : " << payload["kyle_lambda"].get<double>()     << "\n";
+    std::cout << "  Amihud Illq: " << payload["amihud_illiquidity"].get<double>() << "\n";
     std::cout << "  PDF prob↑  : " << payload["pdf_prob_up"].get<double>()     << "\n";
     std::cout << "  PDF edge   : " << payload["pdf_edge"].get<double>()        << "\n";
     std::cout << "  Composite  : " << payload["composite"].get<double>()       << "\n";
+    std::cout << std::setprecision(2);
+    std::cout << "  Depth 10bp : Bid=" << payload["depth_10bps_bid"].get<double>()
+              << " Ask=" << payload["depth_10bps_ask"].get<double>() << "\n";
+    std::cout << "  Depth 50bp : Bid=" << payload["depth_50bps_bid"].get<double>()
+              << " Ask=" << payload["depth_50bps_ask"].get<double>() << "\n";
+    std::cout << "  Depth 100bp: Bid=" << payload["depth_100bps_bid"].get<double>()
+              << " Ask=" << payload["depth_100bps_ask"].get<double>() << "\n";
 
     std::cout << "  ── Bids ───────────────────────────────────────── \n";
     for (const auto& b : payload["bids"])
@@ -59,6 +69,7 @@ static void purge_signal_state(WelfordEstimator& ret_dist,
                                VPINTracker&      vpin,
                                KalmanOBI&        kalman,
                                KyleLambda&       kyle,
+                               AmihudIlliquidity& amihud,
                                OrderBook&        book,
                                double&           prev_mid,
                                double&           prev_obi)
@@ -69,6 +80,7 @@ static void purge_signal_state(WelfordEstimator& ret_dist,
     vpin.reset();
     kalman.reset();
     kyle.reset();
+    amihud.reset();
     book.bids.clear();
     book.asks.clear();
     prev_mid = 0.0;
@@ -95,12 +107,13 @@ int main()
     std::cout << "[ZMQ] cmd sub connected to 5556\n";
 
     // signal layer
-    WelfordEstimator ret_dist;
-    WelfordEstimator innov_dist;
-    ParkinsonVol     park;
-    VPINTracker      vpin;
-    KalmanOBI        kalman;
-    KyleLambda       kyle;
+    WelfordEstimator  ret_dist;
+    WelfordEstimator  innov_dist;
+    ParkinsonVol      park;
+    VPINTracker       vpin;
+    KalmanOBI         kalman;
+    KyleLambda        kyle;
+    AmihudIlliquidity amihud;
 
     // predictive PDF — default 500ms horizon = 5 ticks of 100ms
     pdf::PredictivePDF predictor(4.0, 5.0);
@@ -172,6 +185,28 @@ int main()
                             kyle.push(dp, sv);
                         }
                         sig.kyle_lambda = kyle.lambda();
+
+                        // micro-price
+                        double micro_price = mid;
+                        if (bid_qty + ask_qty > 0.0) {
+                            micro_price = (best_bid * ask_qty + best_ask * bid_qty) / (bid_qty + ask_qty);
+                        }
+                        sig.micro_price     = micro_price;
+                        sig.micro_price_dev = micro_price - mid;
+
+                        // amihud illiquidity
+                        double dp = (prev_mid > 0.0) ? (mid - prev_mid) : 0.0;
+                        amihud.update(dp, bid_qty + ask_qty);
+                        sig.amihud_illiquidity = amihud.illiquidity();
+
+                        // cumulative depth cushion
+                        CumulativeDepth depth = book.cumulativeDepth(mid);
+                        sig.depth_10bps_bid  = depth.bid_depth_10bps;
+                        sig.depth_10bps_ask  = depth.ask_depth_10bps;
+                        sig.depth_50bps_bid  = depth.bid_depth_50bps;
+                        sig.depth_50bps_ask  = depth.ask_depth_50bps;
+                        sig.depth_100bps_bid = depth.bid_depth_100bps;
+                        sig.depth_100bps_ask = depth.ask_depth_100bps;
 
                         // predictive PDF (uses internally stored dt_)
                         pdf::PdfParams pp = predictor.params(
@@ -263,7 +298,7 @@ int main()
 
                         // 2. purge all signal state — critical for data hygiene
                         purge_signal_state(ret_dist, innov_dist, park,
-                                           vpin, kalman, kyle,
+                                           vpin, kalman, kyle, amihud,
                                            book, prev_mid, prev_obi);
 
                         cur_symbol = new_sym;

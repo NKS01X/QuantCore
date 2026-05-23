@@ -45,9 +45,19 @@ COMPOSITE_POS = "#3fb950"
 COMPOSITE_NEG = "#f85149"
 ZSCORE_COLOR  = "#e3b341"
 
+# New Colors for Indicators
+MICRO_COLOR   = "#e2b6ff" # violet-pink
+AMIHUD_COLOR  = "#ffa657" # warm orange
+DEPTH_10B     = "#85ea2d" # bright lime-green
+DEPTH_10A     = "#ff7b72" # bright red/coral
+DEPTH_50B     = "#3fb950" # green
+DEPTH_50A     = "#f85149" # red
+DEPTH_100B    = "#1f6f2e" # dark forest green
+DEPTH_100A    = "#bd2c2c" # dark red
 
-def make_pen(color, width=1.5):
-    return pg.mkPen(color, width=width)
+
+def make_pen(color, width=1.5, style=QtCore.Qt.PenStyle.SolidLine):
+    return pg.mkPen(color, width=width, style=style)
 
 
 class ZmqThread(threading.Thread):
@@ -55,7 +65,7 @@ class ZmqThread(threading.Thread):
     def __init__(self, q: queue.Queue):
         super().__init__(daemon=True)
         self.q = q
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
 
     def run(self):
         ctx  = zmq.Context()
@@ -66,7 +76,7 @@ class ZmqThread(threading.Thread):
         poller = zmq.Poller()
         poller.register(sock, zmq.POLLIN)
 
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             evts = dict(poller.poll(timeout=100))
             if sock in evts:
                 raw = sock.recv_string()
@@ -86,7 +96,7 @@ class ZmqThread(threading.Thread):
         ctx.term()
 
     def stop(self):
-        self._stop.set()
+        self._stop_event.set()
 
 
 class RollingBuffer:
@@ -192,18 +202,21 @@ class Dashboard:
 
         root.addLayout(header)
 
+        # Stat Row Setup
         stat_row = QtWidgets.QHBoxLayout()
         stat_row.setSpacing(12)
         self.lbl_mid       = self._stat_label("Mid Price",   "--")
+        self.lbl_micro_dev = self._stat_label("Micro Dev",   "--")
         self.lbl_obi       = self._stat_label("OBI (raw)",   "--")
         self.lbl_rz        = self._stat_label("Return Z",    "--")
         self.lbl_vpin      = self._stat_label("VPIN",        "--")
         self.lbl_park      = self._stat_label("Park Vol",    "--")
+        self.lbl_amihud    = self._stat_label("Amihud Illq", "--")
         self.lbl_composite = self._stat_label("Composite",   "--")
         self.lbl_frames    = self._stat_label("Frames",      "0")
         self.lbl_conn      = self._stat_label("Status",      "Connecting…")
-        for w in (self.lbl_mid, self.lbl_obi, self.lbl_rz,
-                  self.lbl_vpin, self.lbl_park, self.lbl_composite,
+        for w in (self.lbl_mid, self.lbl_micro_dev, self.lbl_obi, self.lbl_rz,
+                  self.lbl_vpin, self.lbl_park, self.lbl_amihud, self.lbl_composite,
                   self.lbl_frames, self.lbl_conn):
             stat_row.addWidget(w)
         stat_row.addStretch()
@@ -213,9 +226,15 @@ class Dashboard:
         row1.setSpacing(8)
         row2 = QtWidgets.QHBoxLayout()
         row2.setSpacing(8)
+        row3 = QtWidgets.QHBoxLayout()
+        row3.setSpacing(8)
 
-        self.p1 = self._plot("Mid-Price  (BTC/USDT)", "Price (USDT)", "Ticks")
+        # ── ROW 1 ──
+        self.p1 = self._plot("Mid & Micro Price  (BTC/USDT)", "Price (USDT)", "Ticks")
         self.c_price = self.p1.plot(pen=make_pen(PRICE_COLOR, 2), name="Mid-Price")
+        self.c_micro = self.p1.plot(pen=make_pen(MICRO_COLOR, 1.2, style=QtCore.Qt.PenStyle.DashLine), name="Micro-Price")
+        legend1 = self.p1.addLegend(offset=(10, 10))
+        legend1.setParentItem(self.p1.graphicsItem())
         row1.addWidget(self.p1, stretch=3)
 
         self.p2 = self._plot("Return Z-Score  (Welford)", "Z-Score", "Ticks")
@@ -234,6 +253,7 @@ class Dashboard:
         self.pdf_curve = self.p3.plot(pen=make_pen(ACCENT_COLOR, 2))
         row1.addWidget(self.p3, stretch=2)
 
+        # ── ROW 2 ──
         self.p4 = self._plot("Parkinson Vol  & Vol-Adj OBI", "Value", "Ticks")
         self.c_park    = self.p4.plot(pen=make_pen(VOL_COLOR, 1.5),    name="Park Vol")
         self.c_obinorm = self.p4.plot(pen=make_pen(ACCENT_COLOR, 1.5), name="OBI/Vol")
@@ -259,23 +279,50 @@ class Dashboard:
         legend6.setParentItem(self.p6.graphicsItem())
         row2.addWidget(self.p6, stretch=2)
 
+        # ── ROW 3 ──
         self.p7 = self._plot("Kyle's λ  (Price Impact)", "λ", "Ticks")
         self.c_lambda = self.p7.plot(pen=make_pen(LAMBDA_COLOR, 1.5))
-        row2.addWidget(self.p7, stretch=2)
+        row3.addWidget(self.p7, stretch=2)
+
+        self.p8 = self._plot("Amihud Illiquidity", "Ratio", "Ticks")
+        self.c_amihud = self.p8.plot(pen=make_pen(AMIHUD_COLOR, 1.5))
+        row3.addWidget(self.p8, stretch=2)
+
+        self.p9 = self._plot("Cumulative Depth Cushion", "Quantity", "Ticks")
+        self.c_depth_10b  = self.p9.plot(pen=make_pen(DEPTH_10B, 1.2), name="Bid 10bps")
+        self.c_depth_10a  = self.p9.plot(pen=make_pen(DEPTH_10A, 1.2), name="Ask 10bps")
+        self.c_depth_50b  = self.p9.plot(pen=make_pen(DEPTH_50B, 1.5), name="Bid 50bps")
+        self.c_depth_50a  = self.p9.plot(pen=make_pen(DEPTH_50A, 1.5), name="Ask 50bps")
+        self.c_depth_100b = self.p9.plot(pen=make_pen(DEPTH_100B, 1.8), name="Bid 100bps")
+        self.c_depth_100a = self.p9.plot(pen=make_pen(DEPTH_100A, 1.8), name="Ask 100bps")
+        legend9 = self.p9.addLegend(offset=(10, 10))
+        legend9.setParentItem(self.p9.graphicsItem())
+        row3.addWidget(self.p9, stretch=3)
 
         root.addLayout(row1, stretch=5)
         root.addLayout(row2, stretch=5)
+        root.addLayout(row3, stretch=5)
 
-        self.buf_price   = RollingBuffer(HISTORY_LEN)
-        self.buf_zscore  = RollingBuffer(HISTORY_LEN)
-        self.buf_returns = RollingBuffer(HISTORY_LEN)
-        self.buf_park    = RollingBuffer(HISTORY_LEN)
-        self.buf_obinorm = RollingBuffer(HISTORY_LEN)
-        self.buf_vpin    = RollingBuffer(HISTORY_LEN)
-        self.buf_obi_raw = RollingBuffer(HISTORY_LEN)
-        self.buf_obi_kal = RollingBuffer(HISTORY_LEN)
-        self.buf_innov   = RollingBuffer(HISTORY_LEN)
-        self.buf_lambda  = RollingBuffer(HISTORY_LEN)
+        # Buffers
+        self.buf_price       = RollingBuffer(HISTORY_LEN)
+        self.buf_micro_price = RollingBuffer(HISTORY_LEN)
+        self.buf_micro_dev   = RollingBuffer(HISTORY_LEN)
+        self.buf_zscore      = RollingBuffer(HISTORY_LEN)
+        self.buf_returns     = RollingBuffer(HISTORY_LEN)
+        self.buf_park        = RollingBuffer(HISTORY_LEN)
+        self.buf_obinorm     = RollingBuffer(HISTORY_LEN)
+        self.buf_vpin        = RollingBuffer(HISTORY_LEN)
+        self.buf_obi_raw     = RollingBuffer(HISTORY_LEN)
+        self.buf_obi_kal     = RollingBuffer(HISTORY_LEN)
+        self.buf_innov       = RollingBuffer(HISTORY_LEN)
+        self.buf_lambda      = RollingBuffer(HISTORY_LEN)
+        self.buf_amihud      = RollingBuffer(HISTORY_LEN)
+        self.buf_depth_10b   = RollingBuffer(HISTORY_LEN)
+        self.buf_depth_10a   = RollingBuffer(HISTORY_LEN)
+        self.buf_depth_50b   = RollingBuffer(HISTORY_LEN)
+        self.buf_depth_50a   = RollingBuffer(HISTORY_LEN)
+        self.buf_depth_100b  = RollingBuffer(HISTORY_LEN)
+        self.buf_depth_100a  = RollingBuffer(HISTORY_LEN)
 
         self.frame_count = 0
 
@@ -360,7 +407,20 @@ class Dashboard:
         lam       = d.get("kyle_lambda",     0.0)
         composite = d.get("composite",       0.0)
 
+        # New fields
+        micro_price  = d.get("micro_price",        0.0)
+        micro_dev    = d.get("micro_price_dev",    0.0)
+        amihud_val   = d.get("amihud_illiquidity", 0.0)
+        depth_10b    = d.get("depth_10bps_bid",    0.0)
+        depth_10a    = d.get("depth_10bps_ask",    0.0)
+        depth_50b    = d.get("depth_50bps_bid",    0.0)
+        depth_50a    = d.get("depth_50bps_ask",    0.0)
+        depth_100b   = d.get("depth_100bps_bid",   0.0)
+        depth_100a   = d.get("depth_100bps_ask",   0.0)
+
         self.buf_price.push(mid)
+        self.buf_micro_price.push(micro_price)
+        self.buf_micro_dev.push(micro_dev)
         self.buf_zscore.push(rz)
         self.buf_returns.push(ret)
         self.buf_park.push(park_vol)
@@ -370,8 +430,20 @@ class Dashboard:
         self.buf_obi_kal.push(obi_kal)
         self.buf_innov.push(innov)
         self.buf_lambda.push(lam)
+        self.buf_amihud.push(amihud_val)
+        self.buf_depth_10b.push(depth_10b)
+        self.buf_depth_10a.push(depth_10a)
+        self.buf_depth_50b.push(depth_50b)
+        self.buf_depth_50a.push(depth_50a)
+        self.buf_depth_100b.push(depth_100b)
+        self.buf_depth_100a.push(depth_100a)
 
+        # Set stats labels
         self._set_stat(self.lbl_mid, f"${mid:,.2f}", PRICE_COLOR)
+
+        dev_sign = "+" if micro_dev >= 0 else ""
+        dev_col = BID_COLOR if micro_dev >= 0 else ASK_COLOR
+        self._set_stat(self.lbl_micro_dev, f"{dev_sign}${micro_dev:.2f}", dev_col)
 
         obi_col  = BID_COLOR if obi >= 0 else ASK_COLOR
         sign_str = "+" if obi >= 0 else ""
@@ -385,6 +457,7 @@ class Dashboard:
         vpin_col = BID_COLOR if vpin < 0.4 else WARN_COLOR if vpin < 0.6 else ASK_COLOR
         self._set_stat(self.lbl_vpin, f"{vpin:.3f}", vpin_col)
         self._set_stat(self.lbl_park, f"{park_vol:.5f}", VOL_COLOR)
+        self._set_stat(self.lbl_amihud, f"{amihud_val:.3e}", AMIHUD_COLOR)
 
         comp_col = COMPOSITE_POS if composite > 0 else COMPOSITE_NEG
         self._set_stat(self.lbl_composite, f"{composite:+.3f}", comp_col)
@@ -395,10 +468,14 @@ class Dashboard:
         x = np.arange(n, dtype=np.float64)
 
         y1 = self.buf_price.get()
+        y_micro = self.buf_micro_price.get()
         self.c_price.setData(x, y1)
+        self.c_micro.setData(x, y_micro)
         if len(y1) > 1:
-            pad = max((y1.max() - y1.min()) * 0.1, 1.0)
-            self.p1.setYRange(y1.min() - pad, y1.max() + pad, padding=0)
+            y_min = min(y1.min(), y_micro.min())
+            y_max = max(y1.max(), y_micro.max())
+            pad = max((y_max - y_min) * 0.1, 1.0)
+            self.p1.setYRange(y_min - pad, y_max + pad, padding=0)
 
         y2 = self.buf_zscore.get()
         self.c_zscore.setData(np.arange(len(y2), dtype=np.float64), y2)
@@ -446,6 +523,18 @@ class Dashboard:
         y7 = self.buf_lambda.get()
         self.c_lambda.setData(np.arange(len(y7), dtype=np.float64), y7)
 
+        y8 = self.buf_amihud.get()
+        self.c_amihud.setData(np.arange(len(y8), dtype=np.float64), y8)
+
+        # Plot 9 - Cumulative Depth Bands
+        idx_x = np.arange(len(self.buf_depth_10b), dtype=np.float64)
+        self.c_depth_10b.setData(idx_x, self.buf_depth_10b.get())
+        self.c_depth_10a.setData(idx_x, self.buf_depth_10a.get())
+        self.c_depth_50b.setData(idx_x, self.buf_depth_50b.get())
+        self.c_depth_50a.setData(idx_x, self.buf_depth_50a.get())
+        self.c_depth_100b.setData(idx_x, self.buf_depth_100b.get())
+        self.c_depth_100a.setData(idx_x, self.buf_depth_100a.get())
+
     # ── config change handler ──────────────────────────────────────────────
 
     def _on_apply(self):
@@ -467,16 +556,20 @@ class Dashboard:
         self.title_label.setText(f"⚡  {pretty}  ·  Real-Time Microstructure")
 
         # purge all rolling buffers so stale data doesn't mix with the new feed
-        for buf in (self.buf_price, self.buf_zscore, self.buf_returns,
-                    self.buf_park, self.buf_obinorm, self.buf_vpin,
-                    self.buf_obi_raw, self.buf_obi_kal, self.buf_innov,
-                    self.buf_lambda):
+        for buf in (self.buf_price, self.buf_micro_price, self.buf_micro_dev,
+                    self.buf_zscore, self.buf_returns, self.buf_park, 
+                    self.buf_obinorm, self.buf_vpin, self.buf_obi_raw, 
+                    self.buf_obi_kal, self.buf_innov, self.buf_lambda, 
+                    self.buf_amihud, self.buf_depth_10b, self.buf_depth_10a,
+                    self.buf_depth_50b, self.buf_depth_50a, 
+                    self.buf_depth_100b, self.buf_depth_100a):
             buf._n    = 0
             buf._head = 0
             buf._buf[:] = 0.0
 
         # clear all plot curves immediately
         self.c_price.setData([], [])
+        self.c_micro.setData([], [])
         self.c_zscore.setData([], [])
         self.c_park.setData([], [])
         self.c_obinorm.setData([], [])
@@ -485,6 +578,13 @@ class Dashboard:
         self.c_obi_kalman.setData([], [])
         self.c_innov.setData([], [])
         self.c_lambda.setData([], [])
+        self.c_amihud.setData([], [])
+        self.c_depth_10b.setData([], [])
+        self.c_depth_10a.setData([], [])
+        self.c_depth_50b.setData([], [])
+        self.c_depth_50a.setData([], [])
+        self.c_depth_100b.setData([], [])
+        self.c_depth_100a.setData([], [])
         self.pdf_curve.setData([], [])
         if self.hist_bars is not None:
             self.p3.removeItem(self.hist_bars)

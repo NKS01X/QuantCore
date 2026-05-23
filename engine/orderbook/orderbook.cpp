@@ -50,6 +50,47 @@ double OrderBook::bestBid() const { return bids.empty() ? 0.0 : bids.begin()->fi
 double OrderBook::bestAsk() const { return asks.empty() ? 0.0 : asks.begin()->first; }
 double OrderBook::topBidQty() const { return bids.empty() ? 0.0 : bids.begin()->second; }
 double OrderBook::topAskQty() const { return asks.empty() ? 0.0 : asks.begin()->second; }
+CumulativeDepth OrderBook::cumulativeDepth(double mid) const
+{
+    CumulativeDepth depth;
+    if (mid <= 0.0) return depth;
+
+    // Basis point limits
+    double limit_bid_10 = mid * (1.0 - 0.0010);
+    double limit_ask_10 = mid * (1.0 + 0.0010);
+
+    double limit_bid_50 = mid * (1.0 - 0.0050);
+    double limit_ask_50 = mid * (1.0 + 0.0050);
+
+    double limit_bid_100 = mid * (1.0 - 0.0100);
+    double limit_ask_100 = mid * (1.0 + 0.0100);
+
+    for (const auto& [p, q] : bids) {
+        if (p >= limit_bid_10) {
+            depth.bid_depth_10bps += q;
+        }
+        if (p >= limit_bid_50) {
+            depth.bid_depth_50bps += q;
+        }
+        if (p >= limit_bid_100) {
+            depth.bid_depth_100bps += q;
+        }
+    }
+
+    for (const auto& [p, q] : asks) {
+        if (p <= limit_ask_10) {
+            depth.ask_depth_10bps += q;
+        }
+        if (p <= limit_ask_50) {
+            depth.ask_depth_50bps += q;
+        }
+        if (p <= limit_ask_100) {
+            depth.ask_depth_100bps += q;
+        }
+    }
+
+    return depth;
+}
 
 json OrderBook::toJson(int depth, const SignalState& sig) const
 {
@@ -72,6 +113,18 @@ json OrderBook::toJson(int depth, const SignalState& sig) const
     out["innovation_zscore"] = sig.innovation_zscore;
 
     out["kyle_lambda"] = sig.kyle_lambda;
+    
+    // New fields
+    out["micro_price"]        = sig.micro_price;
+    out["micro_price_dev"]    = sig.micro_price_dev;
+    out["amihud_illiquidity"] = sig.amihud_illiquidity;
+    out["depth_10bps_bid"]    = sig.depth_10bps_bid;
+    out["depth_10bps_ask"]    = sig.depth_10bps_ask;
+    out["depth_50bps_bid"]    = sig.depth_50bps_bid;
+    out["depth_50bps_ask"]    = sig.depth_50bps_ask;
+    out["depth_100bps_bid"]   = sig.depth_100bps_bid;
+    out["depth_100bps_ask"]   = sig.depth_100bps_ask;
+
     out["composite"]   = sig.composite;
 
     json topBids = json::array();

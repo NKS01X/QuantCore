@@ -10,6 +10,16 @@
 
 using json = nlohmann::json;
 
+struct CumulativeDepth
+{
+    double bid_depth_10bps  = 0.0;
+    double ask_depth_10bps  = 0.0;
+    double bid_depth_50bps  = 0.0;
+    double ask_depth_50bps  = 0.0;
+    double bid_depth_100bps = 0.0;
+    double ask_depth_100bps = 0.0;
+};
+
 class OrderBook
 {
 public:
@@ -24,6 +34,8 @@ public:
     double bestAsk()   const;
     double topBidQty() const;
     double topAskQty() const;
+
+    CumulativeDepth cumulativeDepth(double mid) const;
 
     json toJson(int depth, const SignalState& sig) const;
 };

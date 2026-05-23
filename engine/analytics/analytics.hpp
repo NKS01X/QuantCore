@@ -7,6 +7,7 @@
 #include "kalman.hpp"
 #include "kyle.hpp"
 #include "predictive_pdf.hpp"
+#include "amihud.hpp"
 
 // everything the engine computes per tick, gets serialized into the zmq payload
 struct SignalState
@@ -39,6 +40,21 @@ struct SignalState
     double pdf_sigma   = 0.0;   // uncertainty scale (vpin-penalised parkinson vol)
     double pdf_prob_up = 0.0;   // P(delta_price > 0)  [0, 1]
     double pdf_edge    = 0.0;   // directional edge = 2*prob_up - 1  [-1, 1]
+
+    // LOB Micro-Price
+    double micro_price     = 0.0;
+    double micro_price_dev = 0.0; // micro_price - mid
+
+    // Amihud Illiquidity
+    double amihud_illiquidity = 0.0;
+
+    // Cumulative Depth Cushion (Bid & Ask for 10, 50, 100 bps)
+    double depth_10bps_bid  = 0.0;
+    double depth_10bps_ask  = 0.0;
+    double depth_50bps_bid  = 0.0;
+    double depth_50bps_ask  = 0.0;
+    double depth_100bps_bid = 0.0;
+    double depth_100bps_ask = 0.0;
 
     // final output
     double composite = 0.0;
